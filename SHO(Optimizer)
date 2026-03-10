@@ -1,0 +1,578 @@
+# %% SELFISH HERD OPTIMIZER (SHO)
+# %   Author and programmer: Fernando A. Fausto Martinez
+# %       e-Mail: neosbreak@hotmail.com
+# %       Source Paper:
+# %           Fernando Fausto, Eric Cuevas, Arturo Validivia & Adrian Gonzalez
+# %           "A Global Optimization Algorithm Inspired in the Behavior of Selfish Herds"
+# %           DOI: https://doi.org/10.1016/j.biosystems.2017.07.010
+# %
+# %%  FUNCTION INSTRUCTIONS:
+# %   This function allows to implement the SHO algorithm for the
+# %   optimization of an user defined function. All other required
+# %   sub-functions are included in this script. To implement SHO,
+# %   use the following command line as a template:
+# %
+# %   [xbest,bfit,xbesth,bfith] = SHO(N,itern,f,dims,xd,xu)
+# %
+# %   INPUTS:
+# %       N      -> Population Size
+# %       itern  -> Maximum number of iterations (stop criterior)
+# %       f      -> Objective Function. Invoke Function Handle for this (i.e.@Ackley)
+# %       dims   -> Search Space total dimensions
+# %       xd     -> Search Space Lower Bound (the same for all dimensions)
+# %       xu     -> Search Space Upper Bound (the same for all dimensions)
+# %   OUTPUTS:
+# %       xbest  -> Best Found Solution
+# %       bfit   -> Fitness (quality) of the best found solution
+# %       xbesth -> Best Found Solution for each iteration
+# %       bfith  -> Best Solutions Fitness Evolution by iterations
+
+
+import numpy as np
+from mealpy import Optimizer
+
+
+class SHO(Optimizer):
+    """
+    Selfish Herd Optimizer (SHO)
+
+    This implementation follows the herd–predator population structure of SHO
+    using the custom optimizer interface provided by MEALPY.
+
+    Main characteristics
+    --------------------
+    1. The population is divided into two fixed groups:
+       - Herd members (H)
+       - Predators (P)
+
+    2. The herd ratio is sampled once during initialization and remains fixed
+       throughout the run.
+
+    3. A global memory is maintained using:
+       - Best solution found so far
+       - Best fitness found so far
+       - Worst fitness found so far
+
+    4. The optimization cycle at each iteration consists of:
+       - Herd movement
+       - Predator movement
+       - Fitness re-evaluation
+       - Predation
+       - Herd restoration
+       - Global memory update
+
+    Parameters
+    ----------
+    epoch : int, default=1000
+        Maximum number of iterations.
+
+    pop_size : int, default=50
+        Total number of individuals in the population.
+
+    preys_rate : tuple[float, float], default=(0.7, 0.9)
+        Lower and upper bounds used to randomly determine the fraction
+        of herd members in the population.
+
+    Notes
+    -----
+    - This implementation assumes a continuous search space.
+    - Boundary handling is performed through MEALPY's `correct_solution()`.
+    - The internal population order is preserved because group identity
+      depends on position inside the population list.
+    """
+
+    def __init__(self, epoch=1000, pop_size=50, preys_rate=(0.7, 0.9), **kwargs):
+        super().__init__(**kwargs)
+
+        self.epoch = self.validator.check_int("epoch", epoch, [1, 100000])
+        self.pop_size = self.validator.check_int("pop_size", pop_size, [5, 100000])
+
+        if not isinstance(preys_rate, (tuple, list)) or len(preys_rate) != 2:
+            raise ValueError(
+                "preys_rate must be a tuple/list of length 2, e.g. (0.7, 0.9)"
+            )
+        self.preys_rate = tuple(preys_rate)
+
+        # Preserve the original population order because the split into
+        # herd members and predators is position-based.
+        self.sort_flag = False
+
+        # Register optimizer parameters in the MEALPY ecosystem
+        self.set_parameters(["epoch", "pop_size", "preys_rate"])
+
+    # =========================================================
+    # A. ALGORITHM INITIALIZATION
+    # =========================================================
+
+    def initialize_variables(self):
+        """
+        Initialize internal variables that depend on the optimization problem.
+
+        The optimizer stores:
+        - dimensionality
+        - lower and upper bounds
+        - a scalar search scale used in movement rules
+        - herd/predator group sizes
+        - global memory
+        - historical best records
+        """
+        self.dims = self.problem.n_dims
+        self.lb = np.asarray(self.problem.lb, dtype=float)
+        self.ub = np.asarray(self.problem.ub, dtype=float)
+
+        # Scalar search scale used in distance normalization.
+        # The average range is used so the method remains stable even when
+        # different dimensions have different bounds.
+        self.range_vec = np.maximum(self.ub - self.lb, 1e-12)
+        self.scale = float(np.mean(self.range_vec))
+
+        self.N_h = None
+        self.N_p = None
+
+        # Global memory
+        self.xbest_mem = None
+        self.bfit_mem = None
+        self.wfit_mem = None
+
+        # Historical global memory
+        self.xbest_history = []
+        self.bfit_history = []
+
+    def initialization(self):
+        """
+        STEP 1: Initialize the animal population A.
+        STEP 2: Divide A into herd members H and predators P.
+        STEP 3: Initialize global memory.
+        """
+        if self.pop is None:
+            self.pop = self.generate_population(self.pop_size)
+
+        # 2.1 Define the number of herd members and predators
+        rate = self.preys_rate[0] + (self.preys_rate[1] - self.preys_rate[0]) * self.generator.random()
+        self.N_h = int(np.round(self.pop_size * rate))
+        self.N_p = self.pop_size - self.N_h
+
+        # Safety correction to avoid empty groups
+        if self.N_h <= 0:
+            self.N_h = 1
+            self.N_p = self.pop_size - 1
+        if self.N_p <= 0:
+            self.N_p = 1
+            self.N_h = self.pop_size - 1
+
+        # 2.4 Initialize global memory
+        fit = np.array([agent.target.fitness for agent in self.pop], dtype=float)
+
+        b_idx = np.argmin(fit)
+        w_idx = np.argmax(fit)
+
+        self.xbest_mem = self.pop[b_idx].solution.copy()
+        self.bfit_mem = float(fit[b_idx])
+        self.wfit_mem = float(fit[w_idx])
+
+    # =========================================================
+    # B. INITIALIZE ITERATIONS
+    # =========================================================
+
+    def evolve(self, epoch):
+        """
+        Perform one optimization iteration.
+
+        Iteration workflow
+        ------------------
+        STEP 4: Move herd members using herd movement operators.
+        STEP 5: Move predators using predator movement operators.
+        STEP 6: Re-evaluate all individuals and compute survival values.
+        STEP 7: Perform predation.
+        STEP 8: Restore killed herd members.
+        STEP EX2: Update global memory.
+        """
+        # Rebuild H and P from the current population
+        H_agents = self.pop[:self.N_h]
+        P_agents = self.pop[self.N_h:]
+
+        H = np.array([agent.solution for agent in H_agents], dtype=float)
+        P = np.array([agent.solution for agent in P_agents], dtype=float)
+
+        f_h = np.array([agent.target.fitness for agent in H_agents], dtype=float)
+        f_p = np.array([agent.target.fitness for agent in P_agents], dtype=float)
+
+        # STEP 3: Calculate survival values using the current global memory
+        xbest = self.xbest_mem.copy()
+        SV_h, SV_p = self._survival_values(self.bfit_mem, self.wfit_mem, f_h, f_p)
+
+        # STEP 4: Herd movement
+        H = self._herd_move(H, SV_h, P, SV_p, xbest)
+
+        # STEP 5: Predator movement
+        P = self._predator_move(P, H, SV_h)
+
+        # STEP 6: Re-evaluate all individuals
+        H_agents, f_h = self._build_agents_from_positions(H)
+        P_agents, f_p = self._build_agents_from_positions(P)
+
+        SV_h, SV_p = self._survival_values(self.bfit_mem, self.wfit_mem, f_h, f_p)
+
+        # STEP 7: Predation phase
+        L_idx, K_idx = self._predation(P, H, SV_p, SV_h)
+
+        # STEP 8: Herd restoration phase
+        if len(K_idx) > 0:
+            H = self._restoration(H, SV_h, L_idx, K_idx)
+
+            # Re-evaluate herd after restoration
+            H_agents, f_h = self._build_agents_from_positions(H)
+            SV_h, SV_p = self._survival_values(self.bfit_mem, self.wfit_mem, f_h, f_p)
+
+        # STEP EX2: Update global memory
+        A = np.vstack([H, P])
+        fit = np.concatenate([f_h, f_p])
+
+        b_idx = np.argmin(fit)
+        gbest2 = A[b_idx].copy()
+        bfit2 = float(fit[b_idx])
+
+        if bfit2 <= self.bfit_mem:
+            self.bfit_mem = bfit2
+            self.xbest_mem = gbest2.copy()
+
+        w_idx = np.argmax(fit)
+        wfit2 = float(fit[w_idx])
+
+        if wfit2 >= self.wfit_mem:
+            self.wfit_mem = wfit2
+
+        # Historical records
+        self.xbest_history.append(self.xbest_mem.copy())
+        self.bfit_history.append(self.bfit_mem)
+
+        # Update population while preserving group order
+        self.pop = H_agents + P_agents
+
+    # =========================================================
+    # Auxiliary Methods
+    # =========================================================
+
+    def _correct_position(self, x):
+        """
+        Correct a solution so that it satisfies the search bounds.
+
+        This method delegates the correction strategy to MEALPY.
+        """
+        return self.correct_solution(x)
+
+    def _build_agents_from_positions(self, positions):
+        """
+        Create evaluated agents from an array of candidate solutions.
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            Array with shape (n_agents, dims).
+
+        Returns
+        -------
+        agents : list
+            List of evaluated MEALPY agents.
+        fitness : np.ndarray
+            Fitness vector associated with the created agents.
+        """
+        agents = []
+        fitness = np.zeros(len(positions), dtype=float)
+
+        for i, pos in enumerate(positions):
+            pos = self._correct_position(pos)
+            agent = self.generate_agent(pos)
+            agents.append(agent)
+            fitness[i] = agent.target.fitness
+
+        return agents, fitness
+
+    def _survival_values(self, bfit, wfit, f_h, f_p):
+        """
+        Calculate survival values for herd members and predators.
+
+        Survival values are normalized according to the current best and
+        worst fitness values stored in global memory.
+
+        Parameters
+        ----------
+        bfit : float
+            Best fitness in global memory.
+
+        wfit : float
+            Worst fitness in global memory.
+
+        f_h : np.ndarray
+            Fitness values of herd members.
+
+        f_p : np.ndarray
+            Fitness values of predators.
+
+        Returns
+        -------
+        SV_h : np.ndarray
+            Survival values of herd members.
+
+        SV_p : np.ndarray
+            Survival values of predators.
+        """
+        denom = bfit - wfit
+
+        if abs(denom) < 1e-12:
+            SV_h = np.ones_like(f_h, dtype=float)
+            SV_p = np.ones_like(f_p, dtype=float)
+            return SV_h, SV_p
+
+        SV_h = (f_h - wfit) / denom
+        SV_p = (f_p - wfit) / denom
+
+        # Handle singular cases safely
+        SV_h = np.nan_to_num(SV_h, nan=1.0, posinf=0.0, neginf=0.0)
+        SV_p = np.nan_to_num(SV_p, nan=1.0, posinf=0.0, neginf=0.0)
+
+        return SV_h, SV_p
+
+    # =========================================================
+    # Herd Movement
+    # =========================================================
+
+    def _herd_move(self, H, SV_h, P, SV_p, xbest):
+        """
+        Move all herd members using SHO herd movement operators.
+
+        The herd contains:
+        - One herd leader
+        - Following members
+        - Members that may desert the herd
+
+        Movement rules
+        --------------
+        1. Herd leader movement:
+           - Seemingly cooperative leadership movement
+           - Openly selfish leadership movement
+
+        2. Herd members movement:
+           - Nearest neighbor movement rule
+           - Local crowded horizon movement rule
+           - Herd desertion movement operator
+        """
+        # Select herd leader
+        hL_candidates = np.where(SV_h == np.max(SV_h))[0]
+        if len(hL_candidates) > 1:
+            hL_idx = hL_candidates[self.generator.integers(len(hL_candidates))]
+        else:
+            hL_idx = hL_candidates[0]
+
+        member_idx = np.array([i for i in range(H.shape[0]) if i != hL_idx], dtype=int)
+
+        SV_mean = np.mean(SV_h)
+
+        # Weighted herd center
+        SV_h_wgt = np.tile(SV_h.reshape(-1, 1), (1, self.dims))
+        h_M = np.sum(SV_h_wgt * H, axis=0) / (np.sum(SV_h_wgt, axis=0) + 1e-5)
+
+        # Weighted predator center
+        SV_p_wgt = np.tile(SV_p.reshape(-1, 1), (1, self.dims))
+        p_M = np.sum(SV_p_wgt * P, axis=0) / (np.sum(SV_p_wgt, axis=0) + 1e-5)
+
+        # Herd leader
+        h_L = H[hL_idx].copy()
+
+        # Leader movement
+        if SV_h[hL_idx] == 1:
+            # Seemingly cooperative leadership movement
+            v_bi = p_M - h_L
+            r_bi = np.linalg.norm(v_bi) / self.scale
+            W_L = np.exp(-(r_bi ** 2))
+            move_L = -2 * W_L * v_bi
+        else:
+            # Openly selfish leadership movement
+            v_bi = xbest - h_L
+            r_bi = np.linalg.norm(v_bi) / self.scale
+            W_L = np.exp(-(r_bi ** 2))
+            move_L = 2 * W_L * v_bi
+
+        alpha = self.generator.random(self.dims)
+        H[hL_idx] = self._correct_position(H[hL_idx] + alpha * move_L)
+
+        # Herd members movement
+        for i in member_idx:
+            if SV_h[i] >= self.generator.random():
+                # Following members
+                if SV_h[i] > SV_mean:
+                    # Nearest neighbor movement rule
+                    better_idx = member_idx[SV_h[member_idx] > SV_h[i]]
+
+                    if better_idx.size == 0:
+                        move_iCi = np.zeros(self.dims)
+                    else:
+                        v_bi = H[better_idx] - H[i]
+                        r_bi = np.linalg.norm(v_bi, axis=1) / self.scale
+
+                        Ci_candidates = np.where(r_bi == np.min(r_bi))[0]
+                        if len(Ci_candidates) > 1:
+                            Ci_idx_local = Ci_candidates[self.generator.integers(len(Ci_candidates))]
+                        else:
+                            Ci_idx_local = Ci_candidates[0]
+
+                        h_Ci = H[better_idx[Ci_idx_local]]
+                        W_iCi = SV_h[better_idx[Ci_idx_local]] * np.exp(-(r_bi[Ci_idx_local] ** 2))
+                        move_iCi = W_iCi * (h_Ci - H[i])
+
+                    r_iL = np.linalg.norm(h_L - H[i]) / self.scale
+                    W_iL = SV_h[hL_idx] * np.exp(-(r_iL ** 2))
+                    move_iL = W_iL * (h_L - H[i])
+
+                    beta = self.generator.random(self.dims)
+                    gamma = self.generator.random(self.dims)
+                    H[i] = self._correct_position(H[i] + 2 * (beta * move_iL + gamma * move_iCi))
+                else:
+                    # Local crowded horizon movement rule
+                    delta = self.generator.random(self.dims)
+                    move_iM = h_M - H[i]
+                    H[i] = self._correct_position(H[i] + 2 * delta * move_iM)
+            else:
+                # Herd desertion movement operator
+                V = self.generator.normal(0, 1, self.dims)
+                normV = np.linalg.norm(V)
+
+                if normV == 0:
+                    v_i = np.zeros(self.dims)
+                else:
+                    v_i = (V / normV) / self.scale
+
+                W_rand = 1 - SV_h[i]
+                rand_move = W_rand * v_i
+
+                v_bi = xbest - H[i]
+                r_bi = np.linalg.norm(v_bi) / self.scale
+                W_dp = np.exp(-(r_bi ** 2))
+                move_bi = W_dp * v_bi
+
+                beta = self.generator.random(self.dims)
+                gamma = self.generator.random(self.dims)
+                H[i] = self._correct_position(H[i] + 2 * (beta * move_bi + gamma * rand_move))
+
+        return H
+
+    # =========================================================
+    # Predator Movement
+    # =========================================================
+
+    def _predator_move(self, P, H, SV_h):
+        """
+        Move all predators toward herd members selected by roulette sampling.
+
+        Predators preferentially move toward weaker herd members through
+        selection probabilities proportional to (1 - survival value).
+        """
+        PV_h = 1 - SV_h
+
+        for i in range(P.shape[0]):
+            h_r = H[self._roulette_selection(PV_h)]
+            move_ir = h_r - P[i]
+            omega = self.generator.random(self.dims)
+            P[i] = self._correct_position(P[i] + 2 * omega * move_ir)
+
+        return P
+
+    # =========================================================
+    # Predation Phase
+    # =========================================================
+
+    def _predation(self, P, H, SV_p, SV_h):
+        """
+        Determine which herd members survive and which ones are killed.
+
+        A predator may eliminate a herd member if:
+        1. The herd member is weaker than the predator.
+        2. The herd member is located inside the predator interaction radius.
+        """
+        R = np.sum(np.max(H, axis=0) - np.min(H, axis=0)) / (2 * self.dims)
+
+        L_idx = list(range(H.shape[0]))
+        K_idx = []
+
+        for i in range(P.shape[0]):
+            weak_idx = [idx for idx in L_idx if SV_h[idx] < SV_p[i]]
+
+            if len(weak_idx) > 0:
+                weak_positions = H[weak_idx]
+                v_ij = weak_positions - P[i]
+                r_ij = np.linalg.norm(v_ij, axis=1)
+
+                Tpi_idx = np.where(r_ij < R)[0]
+
+                if len(Tpi_idx) > 0:
+                    weak_idx_arr = np.array(weak_idx)
+                    target_weights = (1 - SV_h[weak_idx_arr[Tpi_idx]]) * np.exp(-(r_ij[Tpi_idx] ** 2))
+                    target_local = self._roulette_selection(target_weights)
+                    killed = weak_idx[Tpi_idx[target_local]]
+
+                    K_idx.append(killed)
+                    L_idx = [idx for idx in L_idx if idx != killed]
+
+        return np.array(L_idx, dtype=int), np.array(K_idx, dtype=int)
+
+    # =========================================================
+    # Restoration Phase
+    # =========================================================
+
+    def _restoration(self, H, SV_h, L_idx, K_idx):
+        """
+        Restore killed herd members by recombining coordinates sampled from
+        surviving herd members.
+
+        Each restored solution is created by:
+        1. Sampling one coordinate at a time from alive herd members through
+           roulette selection based on survival values.
+        2. Randomly permuting the assembled coordinate vector.
+        """
+        alive_H = H[L_idx]
+        alive_SVh = SV_h[L_idx]
+
+        new_h = np.zeros((len(K_idx), self.dims), dtype=float)
+
+        for i in range(len(K_idx)):
+            new_h_aux = np.zeros(self.dims, dtype=float)
+
+            for gen in range(self.dims):
+                pose_i = self._roulette_selection(alive_SVh)
+                new_h_aux[gen] = alive_H[pose_i, gen]
+
+            new_sol = new_h_aux[self.generator.permutation(len(new_h_aux))]
+            new_h[i] = self._correct_position(new_sol)
+
+        H[K_idx] = new_h
+        return H
+
+    # =========================================================
+    # Roulette Selection
+    # =========================================================
+
+    def _roulette_selection(self, data):
+        """
+        Perform roulette-wheel selection over a 1D array of nonnegative weights.
+
+        If the weight sum is invalid or non-positive, a uniform random index
+        is returned instead.
+        """
+        data = np.asarray(data, dtype=float).flatten()
+
+        if len(data) == 0:
+            raise ValueError("Roulette selection received an empty array.")
+
+        total = np.sum(data)
+
+        if total <= 0 or np.any(np.isnan(data)) or np.any(np.isinf(data)):
+            return int(self.generator.integers(len(data)))
+
+        roulette = np.cumsum(data / total)
+        trial = self.generator.random()
+        selection = np.searchsorted(roulette, trial, side="right")
+
+        if selection >= len(data):
+            selection = len(data) - 1
+
+        return int(selection)
