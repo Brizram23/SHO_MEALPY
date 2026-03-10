@@ -1,0 +1,40 @@
+import numpy as np
+from mealpy import FloatVar
+
+
+def Ackley(x):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    return (
+        -20 * np.exp(-0.2 * np.sqrt(np.sum(x**2) / n))
+        - np.exp(np.sum(np.cos(2 * np.pi * x)) / n)
+        + 20
+        + np.e
+    )
+
+
+problem = {
+    "obj_func": Ackley,
+    "bounds": FloatVar(lb=[-32.8] * 30, ub=[32.8] * 30),
+    "minmax": "min",
+}
+
+runs = 30
+results = np.zeros(runs)
+
+for i in range(runs):
+    model = SHO(epoch=1000, pop_size=50)
+    g_best = model.solve(problem, seed=i)
+    results[i] = g_best.target.fitness
+    print(f"Run {i+1}/{runs}: {results[i]:.6e}")
+
+AB = np.mean(results)
+MB = np.median(results)
+SD = np.std(results)
+
+print("\n=====================================")
+print("RESULTADOS SHO (ACKLEY - f1)")
+print("=====================================")
+print(f"AB (Average Best-so-far) = {AB:e}")
+print(f"MB (Median Best-so-far)  = {MB:e}")
+print(f"SD (Std. Deviation)      = {SD:e}")
